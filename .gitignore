@@ -1,0 +1,36 @@
+# --- 비밀/로컬 설정 (절대 커밋 금지) ---
+.env
+.env.local
+.env.*.local
+
+# --- OS ---
+.DS_Store
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- Node / Next.js (현재 미사용이지만 요청에 따라 포함) ---
+node_modules/
+.next/
+
+# --- 에디터/로컬 도구 ---
+.claude/
+.vscode/
+.idea/
+
+# --- 앱이 런타임에 생성하는 데이터/캐시 (소스 아님, 실행 시 자동 생성) ---
+screener_cache.json
+keyword_tracker.json
+trade_cache.json
+watchlist.json
+*.tmp
+
+# --- 사용자 업로드 (Paper Maker) ---
+uploads/
+
+# --- 로그 ---
+*.log
