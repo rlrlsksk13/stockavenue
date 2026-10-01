@@ -744,17 +744,22 @@
                 },
             });
         }
+        let screenerLoadedAt = 0;          // 마지막으로 화면에 렌더한 시각(ms)
+        const SCREENER_STALE_MS = 15 * 60 * 1000;
         async function loadScreener(market, refresh) {
             if (market !== 'us') return;
             if (screenerLoading) return;
             screenerLoading = true;
+            // 요청이 멈춰도(맥 잠자기·서버 재시작 등) 로딩 플래그가 영구히 묶이지 않도록 타임아웃
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 120000);
             const content = document.getElementById('scContent');
             const meta = document.getElementById('scMeta');
             content.innerHTML = `<div class="sc-loading">${refresh ? '강제 갱신 중 (약 30초 소요)' : '불러오는 중...'}</div>`;
             meta.innerHTML = '';
             try {
                 const url = `/api/screener/us${refresh ? '?refresh=true' : ''}`;
-                const resp = await fetch(url);
+                const resp = await fetch(url, { signal: ctrl.signal, cache: 'no-store' });
                 // 로딩 중 다른 탭(예: 수출데이터)으로 전환됐으면 콘텐츠를 덮어쓰지 않음
                 if (currentScreenerMarket !== market) return;
                 if (!resp.ok) {
@@ -765,12 +770,25 @@
                 const data = await resp.json();
                 if (currentScreenerMarket !== market) return;
                 renderScreener(data);
+                screenerLoadedAt = Date.now();
             } catch (e) {
-                content.innerHTML = `<div class="sc-error">네트워크 에러: ${escHtml(e.message)}</div>`;
+                const msg = e.name === 'AbortError' ? '응답 시간 초과(120초) — 서버가 켜져 있는지 확인' : e.message;
+                content.innerHTML = `<div class="sc-error">네트워크 에러: ${escHtml(msg)}</div>`;
             } finally {
+                clearTimeout(timer);
                 screenerLoading = false;
             }
         }
+        // 탭을 오래 열어둔 뒤 돌아오면(다음 날 아침 등) 자동으로 최신 데이터 재요청
+        function refreshScreenerIfStale() {
+            if (document.visibilityState !== 'visible') return;
+            if (!document.getElementById('screener').classList.contains('active')) return;
+            if (currentScreenerMarket !== 'us') return;
+            if (Date.now() - screenerLoadedAt > SCREENER_STALE_MS) loadScreener('us');
+        }
+        document.addEventListener('visibilitychange', refreshScreenerIfStale);
+        window.addEventListener('focus', refreshScreenerIfStale);
+        setInterval(refreshScreenerIfStale, 5 * 60 * 1000);
         function renderScreenerTable(rows, type) {
             if (!rows || !rows.length) return '<div class="sc-loading">데이터 없음</div>';
             const sign = type === 'up' ? '+' : '';
@@ -831,12 +849,14 @@
             const staleBanner = data.stale
                 ? `<div style="background:#fdecea;border:1px solid #f5c2c0;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#8a1c1c;">⚠️ 최신 데이터 수집 실패 — 직전 캐시(${escHtml(data.date)})를 표시 중입니다. (${escHtml(data.error || '')})</div>`
                 : '';
-            const fallbackBanner = data.source === 'nasdaq'
-                ? '<div style="background:#eef4ff;border:1px solid #b6ccf5;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#1c3d8a;">ℹ️ Finviz 응답 실패로 Nasdaq 스크리너(시총 $10B+) 데이터로 대체했습니다. 장 시작 전에는 직전 세션 변동률이 표시됩니다.</div>'
+            const srcLabel = { finviz: 'Finviz', tradingview: 'TradingView', nasdaq: 'Nasdaq' };
+            const errs = Object.entries(data.source_errors || {}).map(([k, v]) => `${srcLabel[k] || k}: ${v}`).join(' · ');
+            const fallbackBanner = data.source && data.source !== 'finviz'
+                ? `<div style="background:#eef4ff;border:1px solid #b6ccf5;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#1c3d8a;">ℹ️ Finviz 수집 실패로 ${escHtml(srcLabel[data.source] || data.source)} 데이터(시총 $10B+)로 대체했습니다. 장 시작 전에는 직전 세션 변동률이 표시됩니다.${errs ? ` <span style="color:#667">(${escHtml(errs)})</span>` : ''}</div>`
                 : '';
             meta.innerHTML = `
                 ${staleBanner}${fallbackBanner}${preMarketBanner}
-                기준일: <b>${escHtml(data.date)}</b>${cached} · 소스 ${escHtml(data.source || '')} · 필터 ${escHtml(filterLabel)} · ${gen}
+                미국 세션: <b>${escHtml(data.session_date || data.date)}</b>${data.market_open ? ' <span style="color:#c8102e">● 장중</span>' : ''}${cached} · 소스 ${escHtml(data.source || '')} · 필터 ${escHtml(filterLabel)} · ${gen}
                 <button onclick="loadScreener('us', true)">↻ 강제 갱신</button>
             `;
             const content = document.getElementById('scContent');

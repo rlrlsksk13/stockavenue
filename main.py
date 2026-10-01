@@ -10,7 +10,9 @@ import time
 import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from html.parser import HTMLParser
-from typing import List
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional
+from zoneinfo import ZoneInfo
 from urllib.parse import quote_plus
 
 import httpx
@@ -640,7 +642,9 @@ async def put_watchlist(payload: dict):
 # --- Screener (US) ---
 
 SCREENER_CACHE_FILE = os.path.join(os.path.dirname(__file__) or ".", "screener_cache.json")
-SCREENER_TOP_N = 30
+US_SCREENER_TOP_N = 30   # (SCREENER_TOP_N 은 아래 무역 스크리너가 20으로 재정의하므로 별도 이름 사용)
+SCREENER_TTL_OPEN = 15 * 60       # 미국 정규장 중 캐시 15분
+SCREENER_TTL_CLOSED = 2 * 60 * 60 # 장외 2시간
 SCREENER_HEADLINE_CONCURRENCY = 5
 
 
@@ -725,8 +729,8 @@ class _TableParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.tables: list[list[list[dict]]] = []
         self._stack: list[list[list[dict]]] = []   # 중첩 테이블 대응
-        self._row: list[dict] | None = None
-        self._cell: dict | None = None
+        self._row: Optional[list] = None
+        self._cell: Optional[dict] = None
 
     def handle_starttag(self, tag, attrs):
         if tag == "table":
@@ -835,30 +839,32 @@ def parse_finviz_html(html_text: str) -> list[dict]:
     return rows
 
 
-async def _get_with_retry(client: httpx.AsyncClient, url: str, **kw) -> httpx.Response | None:
-    """429/5xx/네트워크 오류 시 지수 백오프로 재시도. 최종 실패 시 None."""
+async def _request_with_retry(client: httpx.AsyncClient, method: str, url: str, **kw) -> httpx.Response:
+    """429/5xx/네트워크 오류 시 지수 백오프로 재시도. 최종 실패 시 사유를 담은 RuntimeError."""
+    reason = ""
     for attempt in range(HTTP_RETRIES):
         try:
-            r = await client.get(url, **kw)
+            r = await client.request(method, url, **kw)
             if r.status_code == 200:
                 return r
+            reason = f"HTTP {r.status_code}"
             if r.status_code not in (429, 500, 502, 503, 504):
-                print(f"[screener] {url} → HTTP {r.status_code}")
-                return None
+                break
             wait = float(r.headers.get("Retry-After", 0) or 0) or (1.5 * 2 ** attempt)
         except httpx.HTTPError as e:
-            print(f"[screener] {url} → {type(e).__name__}")
+            reason = type(e).__name__
             wait = 1.5 * 2 ** attempt
         if attempt < HTTP_RETRIES - 1:
             await asyncio.sleep(min(wait, 10))
-    return None
+    print(f"[screener] {method} {url} → {reason}")
+    raise RuntimeError(reason)
 
 
 async def scrape_finviz_page(client: httpx.AsyncClient, params: dict) -> list[dict]:
     """Fetch one Finviz screener page (≤20 rows) and parse. Returns list of row dicts."""
     qs = "&".join(f"{k}={v}" for k, v in params.items())
-    r = await _get_with_retry(
-        client,
+    r = await _request_with_retry(
+        client, "GET",
         f"{FINVIZ_BASE}?{qs}",
         headers={
             "User-Agent": FINVIZ_UA,
@@ -868,8 +874,6 @@ async def scrape_finviz_page(client: httpx.AsyncClient, params: dict) -> list[di
         },
         follow_redirects=True,
     )
-    if r is None:
-        return []
     rows = parse_finviz_html(r.text)
     if not rows:
         print(f"[screener] Finviz 응답 200이지만 파싱 0행 ({len(r.text)} bytes) — 차단 페이지 또는 레이아웃 변경")
@@ -881,11 +885,16 @@ async def fetch_finviz_sorted(client: httpx.AsyncClient, order: str, n: int) -> 
     order='-change' for top gainers, order='change' for top losers.
     Uses cap_largeover ($10B+) filter. Pages are 20 rows each."""
     rows: list[dict] = []
-    seen: set[str] = set()
+    seen: set = set()
     r = 1
     while len(rows) < n:
         params = {"v": "111", "f": "cap_largeover", "o": order, "r": str(r)}
-        page = await scrape_finviz_page(client, params)
+        try:
+            page = await scrape_finviz_page(client, params)
+        except RuntimeError:
+            if not rows:
+                raise
+            break   # 2페이지 이후 실패는 1페이지 결과로 진행
         new = [x for x in page if x["symbol"] not in seen]
         if not new:
             break
@@ -898,14 +907,82 @@ async def fetch_finviz_sorted(client: httpx.AsyncClient, order: str, n: int) -> 
     return rows[:n]
 
 
-# --- Fallback: Nasdaq 스크리너 JSON API (Finviz 실패 시) ---
-# 전 종목(약 7천 개)을 한 번에 받아 시총 $10B+ 필터 후 변동률로 정렬. HTML이 아닌 JSON이라 레이아웃 변경 영향 없음.
+async def source_finviz(client: httpx.AsyncClient, n: int):
+    gainers, losers = await asyncio.gather(
+        fetch_finviz_sorted(client, "-change", n),
+        fetch_finviz_sorted(client, "change", n),
+    )
+    if not gainers or not losers:
+        raise RuntimeError("파싱 0행 (차단 페이지 또는 레이아웃 변경)")
+    return gainers, losers
+
+
+# --- 폴백 1: TradingView 스캐너 JSON API ---
+# 서버측에서 시총 $10B+ 필터·변동률 정렬까지 해주는 공개 JSON 엔드포인트. HTML이 아니라 레이아웃 변경 영향 없음.
+TRADINGVIEW_SCAN_URL = "https://scanner.tradingview.com/america/scan"
+TRADINGVIEW_COLUMNS = ["name", "description", "close", "change", "market_cap_basic", "sector", "industry"]
+
+
+async def _tradingview_scan(client: httpx.AsyncClient, order: str, n: int) -> list[dict]:
+    body = {
+        "filter": [
+            {"left": "market_cap_basic", "operation": "egreater", "right": LARGE_CAP_MIN},
+            {"left": "type", "operation": "in_range", "right": ["stock", "dr"]},
+            {"left": "is_primary", "operation": "equal", "right": True},
+        ],
+        "markets": ["america"],
+        "options": {"lang": "en"},
+        "symbols": {"query": {"types": []}, "tickers": []},
+        "columns": TRADINGVIEW_COLUMNS,
+        "sort": {"sortBy": "change", "sortOrder": order},
+        "range": [0, n],
+    }
+    r = await _request_with_retry(
+        client, "POST", TRADINGVIEW_SCAN_URL, json=body,
+        headers={
+            "User-Agent": FINVIZ_UA,
+            "Origin": "https://www.tradingview.com",
+            "Referer": "https://www.tradingview.com/",
+        },
+    )
+    out = []
+    for item in (r.json().get("data") or []):
+        d = dict(zip(TRADINGVIEW_COLUMNS, item.get("d") or []))
+        sym = (d.get("name") or "").upper()
+        if not sym:
+            continue
+        chg, close = d.get("change"), d.get("close")
+        out.append({
+            "symbol": sym.replace(".", "-"),          # BRK.B → BRK-B (Finviz 표기와 통일)
+            "name": d.get("description") or sym,
+            "sector": d.get("sector") or "",
+            "industry": d.get("industry") or "",
+            "country": "",
+            "market_cap": format_market_cap(d.get("market_cap_basic")),
+            "close": round(float(close), 2) if close is not None else None,
+            "change_pct": round(float(chg), 2) if chg is not None else None,
+        })
+    return out
+
+
+async def source_tradingview(client: httpx.AsyncClient, n: int):
+    gainers, losers = await asyncio.gather(
+        _tradingview_scan(client, "desc", n),
+        _tradingview_scan(client, "asc", n),
+    )
+    if not gainers or not losers:
+        raise RuntimeError("응답 0행")
+    return gainers, losers
+
+
+# --- 폴백 2: Nasdaq 스크리너 JSON API ---
+# 전 종목(약 7천 개)을 한 번에 받아 시총 $10B+ 필터 후 변동률로 정렬.
 NASDAQ_SCREENER_URL = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&download=true"
 
 
 async def fetch_nasdaq_large_caps(client: httpx.AsyncClient) -> list[dict]:
-    r = await _get_with_retry(
-        client,
+    r = await _request_with_retry(
+        client, "GET",
         NASDAQ_SCREENER_URL,
         headers={
             "User-Agent": FINVIZ_UA,
@@ -915,14 +992,8 @@ async def fetch_nasdaq_large_caps(client: httpx.AsyncClient) -> list[dict]:
             "Referer": "https://www.nasdaq.com/",
         },
     )
-    if r is None:
-        return []
-    try:
-        data = r.json().get("data") or {}
-        raw = data.get("rows") or (data.get("table") or {}).get("rows") or []
-    except Exception as e:
-        print(f"[screener] Nasdaq JSON 파싱 실패: {e}")
-        return []
+    data = r.json().get("data") or {}
+    raw = data.get("rows") or (data.get("table") or {}).get("rows") or []
     out = []
     for x in raw:
         try:
@@ -946,85 +1017,64 @@ async def fetch_nasdaq_large_caps(client: httpx.AsyncClient) -> list[dict]:
     return out
 
 
-async def fetch_movers(client: httpx.AsyncClient, n: int) -> tuple[list[dict], list[dict], str]:
-    """(gainers, losers, source). Finviz 우선, 어느 한쪽이라도 비면 Nasdaq으로 폴백."""
-    gainers, losers = await asyncio.gather(
-        fetch_finviz_sorted(client, "-change", n),
-        fetch_finviz_sorted(client, "change", n),
-    )
-    if gainers and losers:
-        return gainers, losers, "finviz"
-
-    print("[screener] Finviz 실패 → Nasdaq 폴백")
+async def source_nasdaq(client: httpx.AsyncClient, n: int):
     rows = [x for x in await fetch_nasdaq_large_caps(client) if x["change_pct"] is not None]
     if not rows:
-        return gainers, losers, "finviz"
+        raise RuntimeError("응답 0행")
     rows.sort(key=lambda x: x["change_pct"], reverse=True)
-    return rows[:n], rows[::-1][:n], "nasdaq"
+    return rows[:n], rows[::-1][:n]
 
 
-async def fetch_top_headline(client: httpx.AsyncClient, name: str) -> dict:
-    """Top Google News RSS item for a US stock name. {} on failure."""
-    query = (name or "").strip()
-    if not query:
-        return {}
-    url = (
-        "https://news.google.com/rss/search"
-        f"?q={quote_plus(query + ' stock')}&hl=en-US&gl=US&ceid=US:en"
-    )
-    try:
-        r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code != 200:
-            return {}
-        root = ET.fromstring(r.text)
-        first = root.find(".//item")
-        if first is None:
-            return {}
-        return {
-            "title": (first.findtext("title") or "").strip(),
-            "link": (first.findtext("link") or "").strip(),
-        }
-    except Exception:
-        return {}
+SCREENER_SOURCES = [("finviz", source_finviz), ("tradingview", source_tradingview), ("nasdaq", source_nasdaq)]
 
 
-async def translate_headlines_ko(headlines: list[str]) -> list[str]:
-    """Batch-translate English headlines to Korean. Returns same-length list. Falls back to originals on any failure."""
-    if not GEMINI_API_KEY or not headlines:
-        return list(headlines)
-    numbered = "\n".join(f"{i+1}. {h}" for i, h in enumerate(headlines))
-    prompt = (
-        "아래 영문 주식 뉴스 헤드라인들을 자연스럽고 간결한 한국어로 번역하세요.\n"
-        "회사명/티커는 그대로 둡니다. 입력 순서를 그대로 유지하고, JSON 배열로만 응답하세요 (다른 텍스트 금지).\n\n"
-        f"입력:\n{numbered}\n\n"
-        "출력 형식: [\"번역1\", \"번역2\", ...]"
-    )
-    text, err = await call_gemini(
-        parts=[{"text": prompt}],
-        system="당신은 금융 뉴스 번역가입니다. 'Q2 Earnings Beat'은 '2분기 실적 호조', 'price target raised'는 '목표주가 상향' 같이 자연스러운 한국어 표현을 씁니다.",
-        max_tokens=4000,
-    )
-    if err or not text:
-        return list(headlines)
-    text = text.strip()
-    if text.startswith("```"):
-        text = "\n".join(l for l in text.split("\n") if not l.startswith("```"))
-        text = text.strip()
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, list) and len(parsed) == len(headlines):
-            return [str(x) for x in parsed]
-    except Exception:
-        pass
-    return list(headlines)
+async def fetch_movers(client: httpx.AsyncClient, n: int):
+    """(gainers, losers, source, errors). 소스를 순서대로 시도해 처음 성공한 결과 사용.
+    errors = {소스: 실패 사유} — 화면/로그에 노출해 어디서 막혔는지 바로 보이게 함."""
+    errors: dict = {}
+    for name, fn in SCREENER_SOURCES:
+        try:
+            gainers, losers = await fn(client, n)
+            return gainers, losers, name, errors
+        except Exception as e:
+            errors[name] = str(e) or type(e).__name__
+            print(f"[screener] {name} 실패: {errors[name]} → 다음 소스 시도")
+    return [], [], "", errors
+
+
+def us_session_date(now: Optional[datetime] = None) -> str:
+    """현재 시각 기준 '가장 최근에 열린' 미국 정규장 날짜(뉴욕 시간). 공휴일은 미반영(주말만 처리)."""
+    ny = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/New_York"))
+    d = ny.date()
+    if ny.weekday() < 5 and (ny.hour, ny.minute) < (9, 30):
+        d -= timedelta(days=1)          # 개장 전 → 직전 거래일
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)          # 주말 → 금요일
+    return d.isoformat()
+
+
+def us_market_open(now: Optional[datetime] = None) -> bool:
+    ny = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/New_York"))
+    return ny.weekday() < 5 and (9, 30) <= (ny.hour, ny.minute) < (16, 0)
+
+
+def screener_cache_fresh(cached: dict) -> bool:
+    """캐시 유효성: 같은 미국 세션이고 TTL 이내. 장중 15분, 장외 2시간."""
+    if not cached or not cached.get("gainers") and not cached.get("losers"):
+        return False
+    if cached.get("session_date") != us_session_date():
+        return False
+    ttl = SCREENER_TTL_OPEN if us_market_open() else SCREENER_TTL_CLOSED
+    return time.time() - (cached.get("generated_at") or 0) < ttl
 
 
 async def build_us_screener() -> dict:
     async with httpx.AsyncClient(timeout=20.0) as client:
-        # Source: Finviz screener ($10B+, sorted by change%) → 실패 시 Nasdaq 스크리너 폴백
-        gainers, losers, source = await fetch_movers(client, SCREENER_TOP_N)
+        # Source: Finviz → TradingView → Nasdaq 순서로 시도 (시총 $10B+, 변동률 정렬)
+        gainers, losers, source, errors = await fetch_movers(client, US_SCREENER_TOP_N)
         if not gainers and not losers:
-            raise RuntimeError("Finviz·Nasdaq 모두 데이터를 가져오지 못했습니다")
+            detail = ", ".join(f"{k}: {v}" for k, v in errors.items())
+            raise RuntimeError(f"모든 소스 실패 ({detail})")
 
         # Pre-market detection: all changes zero means session hasn't started yet
         all_zero = source == "finviz" and all((r.get("change_pct") or 0) == 0 for r in gainers + losers)
@@ -1055,10 +1105,14 @@ async def build_us_screener() -> dict:
         if row.get("headline") and row["headline"].get("title"):
             row["headline"]["title_ko"] = ko
 
+    session = us_session_date()
     return {
-        "date": time.strftime("%Y-%m-%d"),
+        "date": session,                 # 미국 세션 기준일(뉴욕)
+        "session_date": session,
+        "market_open": us_market_open(),
         "generated_at": int(time.time()),
         "source": source,
+        "source_errors": errors,         # 앞 순위 소스가 실패한 사유
         "filter": "cap_largeover",  # $10B+
         "pre_market": all_zero,
         "gainers": gainers,
@@ -1066,23 +1120,33 @@ async def build_us_screener() -> dict:
     }
 
 
+_screener_lock: Optional[asyncio.Lock] = None   # Python 3.9 호환: 이벤트 루프 안에서 지연 생성
+
+
 @app.get("/api/screener/us")
 async def get_us_screener(refresh: bool = False):
+    global _screener_lock
+    if _screener_lock is None:
+        _screener_lock = asyncio.Lock()
     cache = load_screener_cache()
-    today = time.strftime("%Y-%m-%d")
     cached = cache.get("us")
-    if not refresh and cached and cached.get("date") == today:
+    if not refresh and screener_cache_fresh(cached):
         return {**cached, "cached": True}
-    try:
-        result = await build_us_screener()
-    except Exception as e:
-        # 스크래핑 실패 시 빈 결과로 캐시를 덮어쓰지 않고, 직전 캐시를 stale 표시와 함께 반환
-        print(f"[screener] 빌드 실패: {e}")
-        if cached:
-            return {**cached, "cached": True, "stale": True, "error": str(e)}
-        raise HTTPException(status_code=502, detail=f"스크리너 데이터 수집 실패: {e}")
-    cache["us"] = result
-    save_screener_cache(cache)
+    async with _screener_lock:           # 동시 요청이 와도 빌드는 한 번만
+        cache = load_screener_cache()
+        cached = cache.get("us")
+        if not refresh and screener_cache_fresh(cached):
+            return {**cached, "cached": True}
+        try:
+            result = await build_us_screener()
+        except Exception as e:
+            # 스크래핑 실패 시 빈 결과로 캐시를 덮어쓰지 않고, 직전 캐시를 stale 표시와 함께 반환
+            print(f"[screener] 빌드 실패: {e}")
+            if cached and (cached.get("gainers") or cached.get("losers")):
+                return {**cached, "cached": True, "stale": True, "error": str(e)}
+            raise HTTPException(status_code=502, detail=f"스크리너 데이터 수집 실패: {e}")
+        cache["us"] = result
+        save_screener_cache(cache)
     return {**result, "cached": False}
 
 
