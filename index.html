@@ -828,8 +828,14 @@
             const preMarketBanner = data.pre_market
                 ? '<div style="background:#fff3cd;border:1px solid #ffc107;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#856404;">🕐 미국 정규장 시작 전 시간대로 Finviz의 변동률 컬럼이 0% 상태입니다. 종목 순위는 직전 세션 기준으로 정확하지만, 변동률 수치는 정규장이 열리면 자동으로 갱신됩니다.</div>'
                 : '';
+            const staleBanner = data.stale
+                ? `<div style="background:#fdecea;border:1px solid #f5c2c0;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#8a1c1c;">⚠️ 최신 데이터 수집 실패 — 직전 캐시(${escHtml(data.date)})를 표시 중입니다. (${escHtml(data.error || '')})</div>`
+                : '';
+            const fallbackBanner = data.source === 'nasdaq'
+                ? '<div style="background:#eef4ff;border:1px solid #b6ccf5;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#1c3d8a;">ℹ️ Finviz 응답 실패로 Nasdaq 스크리너(시총 $10B+) 데이터로 대체했습니다. 장 시작 전에는 직전 세션 변동률이 표시됩니다.</div>'
+                : '';
             meta.innerHTML = `
-                ${preMarketBanner}
+                ${staleBanner}${fallbackBanner}${preMarketBanner}
                 기준일: <b>${escHtml(data.date)}</b>${cached} · 소스 ${escHtml(data.source || '')} · 필터 ${escHtml(filterLabel)} · ${gen}
                 <button onclick="loadScreener('us', true)">↻ 강제 갱신</button>
             `;

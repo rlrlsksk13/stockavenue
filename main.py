@@ -9,6 +9,7 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
+from html.parser import HTMLParser
 from typing import List
 from urllib.parse import quote_plus
 
@@ -662,15 +663,28 @@ def save_screener_cache(data: dict) -> None:
 
 FINVIZ_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 FINVIZ_BASE = "https://finviz.com/screener.ashx"
-FINVIZ_ROW_RE = re.compile(
-    r'<tr class="styled-row[^"]*"[^>]*valign="top"[^>]*>([\s\S]+?)</tr>'
-)
-FINVIZ_TD_RE = re.compile(r'<td[^>]*>([\s\S]+?)</td>')
-FINVIZ_TAG_RE = re.compile(r'<[^>]+>')
+FINVIZ_PAGE_SIZE = 20
+FINVIZ_PAGE_DELAY = 0.6          # 페이지 간 간격(초) — 429 차단 회피
+HTTP_RETRIES = 3                 # 429/5xx/타임아웃 재시도 횟수
+LARGE_CAP_MIN = 10_000_000_000   # cap_largeover = $10B+
+
+# Finviz 헤더명 → 내부 필드. 컬럼 순서가 바뀌거나 추가돼도 헤더 이름으로 찾으므로 안 깨짐.
+FINVIZ_HEADER_MAP = {
+    "ticker": "symbol",
+    "company": "name",
+    "sector": "sector",
+    "industry": "industry",
+    "country": "country",
+    "market cap": "market_cap",
+    "price": "close",
+    "change": "change_pct",
+}
+FINVIZ_TICKER_HREF_RE = re.compile(r"quote\.ashx\?t=([A-Za-z0-9.\-]+)")
+PCT_RE = re.compile(r"^[+-]?\d[\d,]*(\.\d+)?%$")
 
 
 def parse_finviz_change(s: str):
-    s = s.strip().replace("%", "").replace(",", "")
+    s = (s or "").strip().replace("%", "").replace(",", "").replace("+", "")
     if not s or s == "-":
         return None
     try:
@@ -680,7 +694,7 @@ def parse_finviz_change(s: str):
 
 
 def parse_finviz_price(s: str):
-    s = s.strip().replace("$", "").replace(",", "")
+    s = (s or "").strip().replace("$", "").replace(",", "")
     if not s or s == "-":
         return None
     try:
@@ -689,37 +703,176 @@ def parse_finviz_price(s: str):
         return None
 
 
+def format_market_cap(v) -> str:
+    """원 단위 시총 → Finviz 표기('3.25T', '512.30B')."""
+    try:
+        v = float(str(v).replace(",", "").replace("$", ""))
+    except (TypeError, ValueError):
+        return ""
+    if v >= 1e12:
+        return f"{v / 1e12:.2f}T"
+    if v >= 1e9:
+        return f"{v / 1e9:.2f}B"
+    if v >= 1e6:
+        return f"{v / 1e6:.2f}M"
+    return f"{v:.0f}" if v else ""
+
+
+class _TableParser(HTMLParser):
+    """페이지의 모든 <table>을 [행[셀{text, hrefs, is_th}]] 구조로 추출 (stdlib만 사용)."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tables: list[list[list[dict]]] = []
+        self._stack: list[list[list[dict]]] = []   # 중첩 테이블 대응
+        self._row: list[dict] | None = None
+        self._cell: dict | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "table":
+            self._stack.append([])
+        elif tag == "tr" and self._stack:
+            self._row = []
+        elif tag in ("td", "th") and self._row is not None:
+            self._cell = {"text": "", "hrefs": [], "is_th": tag == "th"}
+        elif tag == "a" and self._cell is not None:
+            href = dict(attrs).get("href")
+            if href:
+                self._cell["hrefs"].append(href)
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self._cell is not None and self._row is not None:
+            self._cell["text"] = " ".join(self._cell["text"].split())
+            self._row.append(self._cell)
+            self._cell = None
+        elif tag == "tr" and self._row is not None and self._stack:
+            if self._row:
+                self._stack[-1].append(self._row)
+            self._row = None
+        elif tag == "table" and self._stack:
+            self.tables.append(self._stack.pop())
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell["text"] += data
+
+
+def _finviz_rows_by_header(tables) -> list[dict]:
+    """1순위: 'Ticker'와 'Change' 헤더가 있는 테이블을 찾아 헤더 이름으로 컬럼 매핑."""
+    for rows in tables:
+        for hi, header in enumerate(rows[:3]):
+            # 정렬 화살표(▲▼) 등 장식 문자 제거 후 비교
+            names = [re.sub(r"[^a-z0-9/. ]", "", c["text"].lower()).strip() for c in header]
+            if "ticker" not in names or "change" not in names:
+                continue
+            col = {FINVIZ_HEADER_MAP[n]: i for i, n in enumerate(names) if n in FINVIZ_HEADER_MAP}
+            out = []
+            for r in rows[hi + 1:]:
+                if len(r) < len(header) or any(c["is_th"] for c in r):
+                    continue
+                get = lambda f: r[col[f]]["text"] if f in col else ""
+                sym = get("symbol").upper()
+                if not sym:
+                    continue
+                out.append({
+                    "symbol": sym,
+                    "name": get("name"),
+                    "sector": get("sector"),
+                    "industry": get("industry"),
+                    "country": get("country"),
+                    "market_cap": get("market_cap"),
+                    "close": parse_finviz_price(get("close")),
+                    "change_pct": parse_finviz_change(get("change_pct")),
+                })
+            if out:
+                return out
+    return []
+
+
+def _finviz_rows_by_heuristic(tables) -> list[dict]:
+    """2순위(헤더를 못 찾을 때): quote.ashx?t= 링크가 있는 행에서 티커, '%' 셀에서 변동률 추출."""
+    out, seen = [], set()
+    for rows in tables:
+        for r in rows:
+            sym = None
+            for c in r:
+                for h in c["hrefs"]:
+                    m = FINVIZ_TICKER_HREF_RE.search(h)
+                    if m:
+                        sym = m.group(1).upper()
+                        break
+                if sym:
+                    break
+            if not sym or sym in seen:
+                continue
+            texts = [c["text"] for c in r]
+            pct_idx = next((i for i, t in enumerate(texts) if PCT_RE.match(t)), None)
+            if pct_idx is None:
+                continue
+            price = parse_finviz_price(texts[pct_idx - 1]) if pct_idx > 0 else None
+            name = next((t for t in texts if t and t.upper() != sym and not re.match(r"^[\d.,%$+-]+[BMKT]?$", t)), "")
+            seen.add(sym)
+            out.append({
+                "symbol": sym, "name": name, "sector": "", "industry": "", "country": "",
+                "market_cap": "", "close": price, "change_pct": parse_finviz_change(texts[pct_idx]),
+            })
+    return out
+
+
+def parse_finviz_html(html_text: str) -> list[dict]:
+    p = _TableParser()
+    try:
+        p.feed(html_text)
+        p.close()
+    except Exception as e:
+        print(f"[screener] Finviz HTML 파싱 예외: {e}")
+        return []
+    rows = _finviz_rows_by_header(p.tables)
+    if not rows:
+        rows = _finviz_rows_by_heuristic(p.tables)
+        if rows:
+            print("[screener] Finviz 헤더 매핑 실패 → 휴리스틱 파서 사용 (레이아웃 변경 의심)")
+    return rows
+
+
+async def _get_with_retry(client: httpx.AsyncClient, url: str, **kw) -> httpx.Response | None:
+    """429/5xx/네트워크 오류 시 지수 백오프로 재시도. 최종 실패 시 None."""
+    for attempt in range(HTTP_RETRIES):
+        try:
+            r = await client.get(url, **kw)
+            if r.status_code == 200:
+                return r
+            if r.status_code not in (429, 500, 502, 503, 504):
+                print(f"[screener] {url} → HTTP {r.status_code}")
+                return None
+            wait = float(r.headers.get("Retry-After", 0) or 0) or (1.5 * 2 ** attempt)
+        except httpx.HTTPError as e:
+            print(f"[screener] {url} → {type(e).__name__}")
+            wait = 1.5 * 2 ** attempt
+        if attempt < HTTP_RETRIES - 1:
+            await asyncio.sleep(min(wait, 10))
+    return None
+
+
 async def scrape_finviz_page(client: httpx.AsyncClient, params: dict) -> list[dict]:
     """Fetch one Finviz screener page (≤20 rows) and parse. Returns list of row dicts."""
     qs = "&".join(f"{k}={v}" for k, v in params.items())
-    url = f"{FINVIZ_BASE}?{qs}"
-    r = await client.get(
-        url,
-        headers={"User-Agent": FINVIZ_UA, "Referer": "https://finviz.com/"},
+    r = await _get_with_retry(
+        client,
+        f"{FINVIZ_BASE}?{qs}",
+        headers={
+            "User-Agent": FINVIZ_UA,
+            "Referer": "https://finviz.com/",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
         follow_redirects=True,
     )
-    if r.status_code != 200:
+    if r is None:
         return []
-    html_text = r.text
-    rows = []
-    for m in FINVIZ_ROW_RE.finditer(html_text):
-        row_html = m.group(1)
-        tds = FINVIZ_TD_RE.findall(row_html)
-        if len(tds) < 10:
-            continue
-        cells = [FINVIZ_TAG_RE.sub("", td).strip() for td in tds]
-        # Standard v=111 column order:
-        # 0:#  1:Ticker  2:Company  3:Sector  4:Industry  5:Country  6:MarketCap  7:P/E  8:Price  9:Change  10:Volume
-        rows.append({
-            "symbol": cells[1],
-            "name": cells[2],
-            "sector": cells[3],
-            "industry": cells[4],
-            "country": cells[5],
-            "market_cap": cells[6],
-            "close": parse_finviz_price(cells[8]),
-            "change_pct": parse_finviz_change(cells[9]),
-        })
+    rows = parse_finviz_html(r.text)
+    if not rows:
+        print(f"[screener] Finviz 응답 200이지만 파싱 0행 ({len(r.text)} bytes) — 차단 페이지 또는 레이아웃 변경")
     return rows
 
 
@@ -728,18 +881,86 @@ async def fetch_finviz_sorted(client: httpx.AsyncClient, order: str, n: int) -> 
     order='-change' for top gainers, order='change' for top losers.
     Uses cap_largeover ($10B+) filter. Pages are 20 rows each."""
     rows: list[dict] = []
+    seen: set[str] = set()
     r = 1
     while len(rows) < n:
         params = {"v": "111", "f": "cap_largeover", "o": order, "r": str(r)}
         page = await scrape_finviz_page(client, params)
-        if not page:
+        new = [x for x in page if x["symbol"] not in seen]
+        if not new:
             break
-        rows.extend(page)
-        if len(page) < 20:
+        seen.update(x["symbol"] for x in new)
+        rows.extend(new)
+        if len(page) < FINVIZ_PAGE_SIZE:
             break
-        r += 20
-    valid = [x for x in rows if x.get("symbol")]
-    return valid[:n]
+        r += FINVIZ_PAGE_SIZE
+        await asyncio.sleep(FINVIZ_PAGE_DELAY)
+    return rows[:n]
+
+
+# --- Fallback: Nasdaq 스크리너 JSON API (Finviz 실패 시) ---
+# 전 종목(약 7천 개)을 한 번에 받아 시총 $10B+ 필터 후 변동률로 정렬. HTML이 아닌 JSON이라 레이아웃 변경 영향 없음.
+NASDAQ_SCREENER_URL = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&download=true"
+
+
+async def fetch_nasdaq_large_caps(client: httpx.AsyncClient) -> list[dict]:
+    r = await _get_with_retry(
+        client,
+        NASDAQ_SCREENER_URL,
+        headers={
+            "User-Agent": FINVIZ_UA,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://www.nasdaq.com",
+            "Referer": "https://www.nasdaq.com/",
+        },
+    )
+    if r is None:
+        return []
+    try:
+        data = r.json().get("data") or {}
+        raw = data.get("rows") or (data.get("table") or {}).get("rows") or []
+    except Exception as e:
+        print(f"[screener] Nasdaq JSON 파싱 실패: {e}")
+        return []
+    out = []
+    for x in raw:
+        try:
+            cap = float(str(x.get("marketCap") or "0").replace(",", "") or 0)
+        except ValueError:
+            continue
+        sym = (x.get("symbol") or "").strip().upper()
+        # 우선주/워런트 등 특수 클래스('^', '/') 제외
+        if cap < LARGE_CAP_MIN or not sym or "^" in sym or "/" in sym:
+            continue
+        out.append({
+            "symbol": sym,
+            "name": (x.get("name") or "").replace(" Common Stock", "").strip(),
+            "sector": x.get("sector") or "",
+            "industry": x.get("industry") or "",
+            "country": x.get("country") or "",
+            "market_cap": format_market_cap(cap),
+            "close": parse_finviz_price(x.get("lastsale") or ""),
+            "change_pct": parse_finviz_change(x.get("pctchange") or ""),
+        })
+    return out
+
+
+async def fetch_movers(client: httpx.AsyncClient, n: int) -> tuple[list[dict], list[dict], str]:
+    """(gainers, losers, source). Finviz 우선, 어느 한쪽이라도 비면 Nasdaq으로 폴백."""
+    gainers, losers = await asyncio.gather(
+        fetch_finviz_sorted(client, "-change", n),
+        fetch_finviz_sorted(client, "change", n),
+    )
+    if gainers and losers:
+        return gainers, losers, "finviz"
+
+    print("[screener] Finviz 실패 → Nasdaq 폴백")
+    rows = [x for x in await fetch_nasdaq_large_caps(client) if x["change_pct"] is not None]
+    if not rows:
+        return gainers, losers, "finviz"
+    rows.sort(key=lambda x: x["change_pct"], reverse=True)
+    return rows[:n], rows[::-1][:n], "nasdaq"
 
 
 async def fetch_top_headline(client: httpx.AsyncClient, name: str) -> dict:
@@ -800,14 +1021,13 @@ async def translate_headlines_ko(headlines: list[str]) -> list[str]:
 
 async def build_us_screener() -> dict:
     async with httpx.AsyncClient(timeout=20.0) as client:
-        # Source: Finviz screener with cap_largeover ($10B+) filter, sorted by change%
-        gainers, losers = await asyncio.gather(
-            fetch_finviz_sorted(client, "-change", SCREENER_TOP_N),
-            fetch_finviz_sorted(client, "change", SCREENER_TOP_N),
-        )
+        # Source: Finviz screener ($10B+, sorted by change%) → 실패 시 Nasdaq 스크리너 폴백
+        gainers, losers, source = await fetch_movers(client, SCREENER_TOP_N)
+        if not gainers and not losers:
+            raise RuntimeError("Finviz·Nasdaq 모두 데이터를 가져오지 못했습니다")
 
         # Pre-market detection: all changes zero means session hasn't started yet
-        all_zero = all((r.get("change_pct") or 0) == 0 for r in gainers + losers)
+        all_zero = source == "finviz" and all((r.get("change_pct") or 0) == 0 for r in gainers + losers)
 
         # During regular trading, keep only actual gainers (>0) and losers (<0).
         # During pre-market (all_zero), keep all rows since change col resets to 0 — the
@@ -838,7 +1058,7 @@ async def build_us_screener() -> dict:
     return {
         "date": time.strftime("%Y-%m-%d"),
         "generated_at": int(time.time()),
-        "source": "finviz",
+        "source": source,
         "filter": "cap_largeover",  # $10B+
         "pre_market": all_zero,
         "gainers": gainers,
@@ -853,7 +1073,14 @@ async def get_us_screener(refresh: bool = False):
     cached = cache.get("us")
     if not refresh and cached and cached.get("date") == today:
         return {**cached, "cached": True}
-    result = await build_us_screener()
+    try:
+        result = await build_us_screener()
+    except Exception as e:
+        # 스크래핑 실패 시 빈 결과로 캐시를 덮어쓰지 않고, 직전 캐시를 stale 표시와 함께 반환
+        print(f"[screener] 빌드 실패: {e}")
+        if cached:
+            return {**cached, "cached": True, "stale": True, "error": str(e)}
+        raise HTTPException(status_code=502, detail=f"스크리너 데이터 수집 실패: {e}")
     cache["us"] = result
     save_screener_cache(cache)
     return {**result, "cached": False}
